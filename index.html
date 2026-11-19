@@ -2491,6 +2491,43 @@
         return dists[Math.floor(dists.length * 0.5)];
       }
 
+      function extractCsrLayerMaterials(f2, decoder) {
+        const layerNames = new Map();
+        const materials = [];
+        const seen = new Set();
+        for (const lEntry of (f2[2] || [])) {
+          const lm = pbDecodeMap(lEntry.v);
+          const layer = pbFirst(lm, 3) ? decoder.decode(pbFirst(lm, 3)) : "Geometry";
+          const lGuidBytes = pbFirst(lm, 10);
+          if (lGuidBytes) layerNames.set(bytesToHex(lGuidBytes, 0, lGuidBytes.length), layer);
+
+          const matMap = lm[1]?.[0] ? pbDecodeMap(lm[1][0].v) : null;
+          const material = matMap && pbFirst(matMap, 1) ? decoder.decode(pbFirst(matMap, 1)) : "";
+          const category = matMap && pbFirst(matMap, 2) ? decoder.decode(pbFirst(matMap, 2)) : "";
+          const m31 = matMap?.[31]?.[0] ? pbDecodeMap(matMap[31][0].v) : null;
+          const optRaw = m31 ? pbFirst(m31, 3) : null;
+          const optVal = (typeof optRaw === "number" && Number.isFinite(optRaw) && optRaw >= 0 && optRaw <= 1) ? optRaw : null;
+          const m30 = matMap?.[30]?.[0] ? pbDecodeMap(matMap[30][0].v) : null;
+          const rgb = m30 ? [
+            Math.max(0, Math.min(255, Math.round(Number(pbFirst(m30, 1, 205))))),
+            Math.max(0, Math.min(255, Math.round(Number(pbFirst(m30, 2, 205))))),
+            Math.max(0, Math.min(255, Math.round(Number(pbFirst(m30, 3, 205)))))
+          ] : [205, 205, 205];
+          let shade = "";
+          if (lm[101]?.[0]) {
+            const sm = pbDecodeMap(lm[101][0].v);
+            const sm10 = sm[10]?.[0] ? pbDecodeMap(sm[10][0].v) : null;
+            if (sm10 && pbFirst(sm10, 1)) shade = decoder.decode(pbFirst(sm10, 1));
+          }
+          if (!material && !shade) continue;
+          const key = `${layer}|${material}|${shade}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          materials.push({ layer, material, category, optVal, rgb, shade });
+        }
+        return { layerNames, materials };
+      }
+
       function parseNonHourlyCsrBuffer(arrayBuffer, bytes, dv, cursor, version, fileName) {
         const decoder = new TextDecoder("utf-8");
         const c0Len = dv.getUint32(cursor.pos, true); cursor.pos += 4;
@@ -2517,14 +2554,8 @@
         const locMap = f1[1]?.[0] ? pbDecodeMap(f1[1][0].v) : {};
         const locationName = pbFirst(locMap, 1) ? decoder.decode(pbFirst(locMap, 1)) : "";
 
-        // Decode layer dictionary (name + guid)
-        const layerNames = new Map();
-        for (const lEntry of (f2[2] || [])) {
-          const lm = pbDecodeMap(lEntry.v);
-          const lName = pbFirst(lm, 3) ? decoder.decode(pbFirst(lm, 3)) : "Geometry";
-          const lGuidBytes = pbFirst(lm, 10);
-          if (lGuidBytes) layerNames.set(bytesToHex(lGuidBytes, 0, lGuidBytes.length), lName);
-        }
+        // Decode layer dictionary (name + guid + material)
+        const { layerNames, materials } = extractCsrLayerMaterials(f2, decoder);
 
         // Decode Areas & Sensor coordinates & precomputed metrics
         const spatialAreas = [];
@@ -2720,6 +2751,7 @@
           spatial: {
             areas: spatialAreas,
             planCuts,
+            materials,
             projectSummary: {
               udiA: projUdia, udiE: projUdie, udiS: projUdis, udiF: projUdif,
               sda: projSda, sda100: projSda, sda500: projSda,
@@ -2754,6 +2786,7 @@
         const f2 = c1[2]?.[0] ? pbDecodeMap(c1[2][0].v) : {};
         const locMap = f1[1]?.[0] ? pbDecodeMap(f1[1][0].v) : {};
         const locationName = pbFirst(locMap, 1) ? decoder.decode(pbFirst(locMap, 1)) : "";
+        const { materials } = extractCsrLayerMaterials(f2, decoder);
 
         const areas = [];
         let totalPts = 0;
@@ -2882,6 +2915,7 @@
           areaHourlyInt: null,
           hasSummary: true,
           hasHourly: false,
+          materials,
           projectSummary: { sdg: projSdg, blindsOpen: projBlindsOpen, viewpoints: projViewpoints },
           pairedRunId: null,
           cache: new Map()
@@ -6902,11 +6936,11 @@
         return totalW;
       }
 
-      function renderSpatialSubpanel({ ctx, box, run, level, levelData, spec, isDiff, maxAbsDiff, paletteName, showWalls, showSensors, showBadge = true, T }) {
+      function renderSpatialSubpanel({ ctx, box, run, level, levelData, spec, isDiff, maxAbsDiff, paletteName, showWalls, showSensors, showBadge = true, showTitle = true, T }) {
         const { pts, maxH, bounds } = levelData;
         if (!pts.length) return null;
 
-        const innerPad = { top: showBadge ? 18 : 14, right: 6, bottom: 13, left: 6 };
+        const innerPad = { top: showTitle ? (showBadge ? 18 : 14) : 4, right: 6, bottom: 13, left: 6 };
         const aw = Math.max(40, box.w - innerPad.left - innerPad.right);
         const ah = Math.max(40, box.h - innerPad.top - innerPad.bottom);
 
@@ -7121,27 +7155,29 @@
         }
 
         // Subpanel Title & Prominent Clean Metric Readout (no box/background fill)
-        let statW = 0;
-        if (showBadge) {
-          const subSummary = computeSpatialMetricSummary(pts, spec, isDiff);
-          statW = drawMetricText(ctx, subSummary, box.x + box.w - innerPad.right, box.y + 8, {
-            fontSize: 12
-          });
-        }
-
-        ctx.textAlign = "left";
-        ctx.textBaseline = "middle";
-        ctx.fillStyle = T.textSecondary;
-        ctx.font = '600 11px "Segoe UI", sans-serif';
-        let subTitle = box.title || level.shortLabel;
-        const maxTitleW = Math.max(40, box.w - innerPad.left - innerPad.right - (statW > 0 ? statW + 10 : 4));
-        if (ctx.measureText(subTitle).width > maxTitleW) {
-          while (subTitle.length > 4 && ctx.measureText(subTitle + "...").width > maxTitleW) {
-            subTitle = subTitle.slice(0, -1);
+        if (showTitle) {
+          let statW = 0;
+          if (showBadge) {
+            const subSummary = computeSpatialMetricSummary(pts, spec, isDiff);
+            statW = drawMetricText(ctx, subSummary, box.x + box.w - innerPad.right, box.y + 8, {
+              fontSize: 12
+            });
           }
-          subTitle += "...";
+
+          ctx.textAlign = "left";
+          ctx.textBaseline = "middle";
+          ctx.fillStyle = T.textSecondary;
+          ctx.font = '600 11px "Segoe UI", sans-serif';
+          let subTitle = box.title || level.shortLabel;
+          const maxTitleW = Math.max(40, box.w - innerPad.left - innerPad.right - (statW > 0 ? statW + 10 : 4));
+          if (ctx.measureText(subTitle).width > maxTitleW) {
+            while (subTitle.length > 4 && ctx.measureText(subTitle + "...").width > maxTitleW) {
+              subTitle = subTitle.slice(0, -1);
+            }
+            subTitle += "...";
+          }
+          ctx.fillText(subTitle, box.x + innerPad.left, box.y + 8);
         }
-        ctx.fillText(subTitle, box.x + innerPad.left, box.y + 8);
 
         // Physical metric scale bar (compact bottom-left of subpanel)
         const targetBarPx = Math.min(80, drawW * 0.22);
@@ -7166,14 +7202,404 @@
         return { box, ox, oy, drawW, drawH, scale, bounds, cellSz, bins, pts, level, run, s2wX, s2wY, isDiff, spec };
       }
 
+      function getRunMaterials(run) {
+        if (!run) return [];
+        if (run.spatial && Array.isArray(run.spatial.materials) && run.spatial.materials.length) {
+          return run.spatial.materials;
+        }
+        if (run.glare && Array.isArray(run.glare.materials) && run.glare.materials.length) {
+          return run.glare.materials;
+        }
+        return [];
+      }
+
+      function getLevelSpanXY(level) {
+        if (level._spanCache) return level._spanCache;
+        let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+        let maxH = 0.2;
+        for (const sa of (level.areas || [])) {
+          const h = sa.spacingH || 0.35;
+          if (h > maxH) maxH = h;
+          for (let i = 0; i < sa.nPts; i++) {
+            const x = sa.coords[i * 3], y = sa.coords[i * 3 + 1];
+            if (x < minX) minX = x; if (x > maxX) maxX = x;
+            if (y < minY) minY = y; if (y > maxY) maxY = y;
+          }
+        }
+        if (!Number.isFinite(minX)) return { spanX: 1, spanY: 1 };
+        const padW = Math.max(maxH * 2.2, 0.7);
+        let bMinX = minX - padW, bMaxX = maxX + padW, bMinY = minY - padW, bMaxY = maxY + padW;
+        const limitExpand = Math.max((maxX - minX) * 0.25, 2.5);
+        if (level.planCut) {
+          for (const layer of level.planCut.layers) {
+            for (const poly of layer.polylines) {
+              for (let k = 0; k < poly.length; k += 2) {
+                const px = poly[k], py = poly[k + 1];
+                if (px >= minX - limitExpand && px <= maxX + limitExpand && py >= minY - limitExpand && py <= maxY + limitExpand) {
+                  if (px < bMinX) bMinX = px; if (px > bMaxX) bMaxX = px;
+                  if (py < bMinY) bMinY = py; if (py > bMaxY) bMaxY = py;
+                }
+              }
+            }
+          }
+        }
+        const mPad = Math.max(maxH * 0.8, 0.35);
+        level._spanCache = {
+          spanX: Math.max(0.5, (bMaxX + mPad) - (bMinX - mPad)),
+          spanY: Math.max(0.5, (bMaxY + mPad) - (bMinY - mPad))
+        };
+        return level._spanCache;
+      }
+
+      function formatMaterialEntry(m, baseMats = null) {
+        const isGlaz = (m.category || "").toLowerCase().includes("glaz");
+        const optTxt = m.optVal != null ? ` (${Math.round(m.optVal * 100)}% ${isGlaz ? "Tvis" : "R"})` : "";
+        let matTxt = `${m.material || "—"}${optTxt}`;
+        if (m.shade) matTxt += ` · Shade: ${m.shade}`;
+        let diffTag = "";
+        if (Array.isArray(baseMats) && baseMats.length) {
+          const bm = baseMats.find(b => b.layer === m.layer);
+          if (!bm) diffTag = " [new]";
+          else if (bm.material !== m.material || bm.shade !== m.shade) {
+            diffTag = ` [ref: ${bm.material || "—"}]`;
+          }
+        }
+        if (diffTag) matTxt += diffTag;
+        return { layer: m.layer, matTxt, rgb: m.rgb || [205, 205, 205], changed: Boolean(diffTag) };
+      }
+
+      function measureMatTextWidth(txt, fontSpec, isBold, measureCtx) {
+        if (measureCtx && typeof measureCtx.measureText === "function") {
+          measureCtx.font = fontSpec;
+          return measureCtx.measureText(txt).width;
+        }
+        const m = String(fontSpec).match(/(\d+(?:\.\d+)?)px/);
+        const sz = m ? parseFloat(m[1]) : 9.5;
+        return String(txt).length * sz * (isBold ? 0.58 : 0.54);
+      }
+
+      function wrapMaterialWords(words, firstAvailW, contAvailW, fontSpec, measureCtx) {
+        const lines = [];
+        let cur = "";
+        let limit = firstAvailW;
+        for (const w of words) {
+          const cand = cur ? `${cur} ${w}` : w;
+          if (cur && measureMatTextWidth(cand, fontSpec, false, measureCtx) > limit) {
+            lines.push(cur);
+            cur = w;
+            limit = contAvailW;
+          } else {
+            cur = cand;
+          }
+        }
+        if (cur) lines.push(cur);
+        return lines.length ? lines : [""];
+      }
+
+      function layoutTopMaterials(mats, baseMats, availW, measureCtx) {
+        if (!mats || !mats.length) return { cols: 1, colW: availW, rows: [], totalH: 0 };
+        const entries = mats.map(m => formatMaterialEntry(m, baseMats));
+        const layerFont = '600 9.5px "Segoe UI", sans-serif';
+        const matFont = '400 9.5px "Segoe UI", sans-serif';
+        const swPad = 10;
+        const colGap = 14;
+        const cols = availW >= 820 ? 3 : (availW >= 480 ? 2 : 1);
+        const colW = (availW - (cols - 1) * colGap) / cols;
+
+        const singleItems = [];
+        const wideItems = [];
+        for (const ent of entries) {
+          const prefix = `${ent.layer}: `;
+          const lw = measureMatTextWidth(prefix, layerFont, true, measureCtx);
+          const mw = measureMatTextWidth(ent.matTxt, matFont, false, measureCtx);
+          const totalItemW = swPad + lw + mw;
+          const prepared = { ...ent, prefix, lw, mw };
+          if (cols > 1 && totalItemW <= colW) singleItems.push(prepared);
+          else wideItems.push(prepared);
+        }
+
+        const rows = [];
+        const lineH = 13.5;
+        for (let i = 0; i < singleItems.length; i += cols) {
+          rows.push({ kind: "grid", yOff: rows.reduce((s, r) => s + r.h, 0), h: lineH, items: singleItems.slice(i, i + cols) });
+        }
+        for (const wItem of wideItems) {
+          const textW = Math.max(80, availW - swPad);
+          const words = wItem.matTxt.split(/\s+/);
+          const firstWordW = measureMatTextWidth(words[0] || "", matFont, false, measureCtx);
+          const sameLine = wItem.lw + firstWordW <= textW;
+          const lines = sameLine
+            ? wrapMaterialWords(words, Math.max(40, textW - wItem.lw), textW, matFont, measureCtx)
+            : wrapMaterialWords(words, textW, textW, matFont, measureCtx);
+          const lineCnt = sameLine ? lines.length : (1 + lines.length);
+          const h = Math.max(lineH, lineCnt * 12.5 + 1);
+          const yOff = rows.reduce((s, r) => s + r.h, 0);
+          rows.push({ kind: "span", yOff, h, item: { ...wItem, sameLine, lines } });
+        }
+        const totalH = rows.reduce((s, r) => s + r.h, 0) + 4;
+        return { cols, colGap, colW, rows, totalH, layerFont, matFont, swPad };
+      }
+
+      function drawTopMaterialsBlock(ctx, layout, x0, y0, T) {
+        if (!layout || !layout.rows.length) return;
+        const { cols, colGap, colW, rows, layerFont, matFont, swPad } = layout;
+        ctx.textAlign = "left";
+        ctx.textBaseline = "middle";
+
+        const drawEntry = (it, ix, iy, isWide) => {
+          ctx.fillStyle = `rgb(${it.rgb[0]},${it.rgb[1]},${it.rgb[2]})`;
+          ctx.fillRect(ix, iy - 3, 6, 6);
+          ctx.strokeStyle = "#a1a1aa";
+          ctx.lineWidth = 0.7;
+          ctx.strokeRect(ix + 0.5, iy - 2.5, 5, 5);
+
+          ctx.font = layerFont;
+          ctx.fillStyle = T.textPrimary;
+          ctx.fillText(it.prefix, ix + swPad, iy);
+
+          ctx.font = matFont;
+          ctx.fillStyle = it.changed ? "#b45309" : T.textSecondary;
+          if (!isWide) {
+            ctx.fillText(it.matTxt, ix + swPad + it.lw, iy);
+          } else if (it.sameLine) {
+            ctx.fillText(it.lines[0] || "", ix + swPad + it.lw, iy);
+            for (let li = 1; li < it.lines.length; li++) {
+              ctx.fillText(it.lines[li], ix + swPad, iy + li * 12.5);
+            }
+          } else {
+            for (let li = 0; li < it.lines.length; li++) {
+              ctx.fillText(it.lines[li], ix + swPad, iy + (li + 1) * 12.5);
+            }
+          }
+        };
+
+        for (const r of rows) {
+          const ry = y0 + r.yOff + 6.5;
+          if (r.kind === "grid") {
+            for (let c = 0; c < r.items.length && c < cols; c++) {
+              drawEntry(r.items[c], x0 + c * (colW + colGap), ry, false);
+            }
+          } else {
+            drawEntry(r.item, x0, ry, true);
+          }
+        }
+      }
+
+      function layoutSideMaterials(mats, sideInnerW, measureCtx) {
+        if (!mats || !mats.length) return { items: [], totalH: 0 };
+        const hdrFont = '600 9px "Segoe UI", sans-serif';
+        const layerFont = '600 9.5px "Segoe UI", sans-serif';
+        const matFont = '400 9px "Segoe UI", sans-serif';
+        const swPad = 10;
+        const textW = Math.max(60, sideInnerW - swPad);
+        const lineH = 11.5;
+        const itemGap = 3.5;
+
+        const items = [];
+        let yOff = 14; // Reserve space for "Layers & Materials" header
+        for (const m of mats) {
+          const ent = formatMaterialEntry(m, null);
+          const prefix = `${ent.layer}: `;
+          const lw = measureMatTextWidth(prefix, layerFont, true, measureCtx);
+          const words = ent.matTxt.split(/\s+/);
+          const firstW = measureMatTextWidth(words[0] || "", matFont, false, measureCtx);
+          const sameLine = (lw + firstW) <= textW && (textW - lw) >= 34;
+          const lines = sameLine
+            ? wrapMaterialWords(words, Math.max(30, textW - lw), textW, matFont, measureCtx)
+            : wrapMaterialWords(words, textW, textW, matFont, measureCtx);
+          const totalLines = sameLine ? lines.length : (1 + lines.length);
+          const h = totalLines * lineH + itemGap;
+          items.push({ ...ent, prefix, lw, sameLine, lines, yOff, h });
+          yOff += h;
+        }
+        return { items, totalH: yOff + 2, hdrFont, layerFont, matFont, swPad, lineH };
+      }
+
+      function drawSideMaterialsColumn(ctx, layout, x0, y0, T) {
+        if (!layout || !layout.items.length) return;
+        ctx.textAlign = "left";
+        ctx.textBaseline = "middle";
+        ctx.font = layout.hdrFont;
+        ctx.fillStyle = T.textMuted;
+        ctx.fillText("Layers & Materials", x0, y0 + 5);
+
+        for (const it of layout.items) {
+          const iy = y0 + it.yOff + 5;
+          ctx.fillStyle = `rgb(${it.rgb[0]},${it.rgb[1]},${it.rgb[2]})`;
+          ctx.fillRect(x0, iy - 3, 6, 6);
+          ctx.strokeStyle = "#a1a1aa";
+          ctx.lineWidth = 0.7;
+          ctx.strokeRect(x0 + 0.5, iy - 2.5, 5, 5);
+
+          ctx.font = layout.layerFont;
+          ctx.fillStyle = T.textPrimary;
+          ctx.fillText(it.prefix, x0 + layout.swPad, iy);
+
+          ctx.font = layout.matFont;
+          ctx.fillStyle = T.textSecondary;
+          if (it.sameLine) {
+            ctx.fillText(it.lines[0] || "", x0 + layout.swPad + it.lw, iy);
+            for (let li = 1; li < it.lines.length; li++) {
+              ctx.fillText(it.lines[li], x0 + layout.swPad, iy + li * layout.lineH);
+            }
+          } else {
+            for (let li = 0; li < it.lines.length; li++) {
+              ctx.fillText(it.lines[li], x0 + layout.swPad, iy + (li + 1) * layout.lineH);
+            }
+          }
+        }
+      }
+
+      function computeFloorplanLayoutSpec({ runs, activeRun, baseRun, mode, levelKey, w, measureCtx }) {
+        const spatialRuns = (runs || []).filter(r => r.spatial && r.spatial.areas && r.spatial.areas.length);
+        const primaryRun = (activeRun && activeRun.spatial) ? activeRun : spatialRuns[0];
+        const areaW = Math.max(100, w - 16);
+        const selLevelIdx = levelKey === "all" ? -1 : parseInt(levelKey, 10);
+
+        if (!primaryRun) {
+          return { spatialRuns, primaryRun: null, fpHeight: 540, variantSpec: null, topSpec: null };
+        }
+
+        if (mode === "variants") {
+          const runsToPlot = spatialRuns;
+          const runsN = Math.max(1, runsToPlot.length);
+          const allLevelsSelected = selLevelIdx < 0;
+          const maxLvls = allLevelsSelected ? Math.max(1, ...runsToPlot.map(r => getSpatialLevels(r).length)) : 1;
+          const anyHasMats = runsToPlot.some(r => getRunMaterials(r).length > 0);
+
+          let maxDrawW0 = 0;
+          let maxDrawH0 = 0;
+          if (allLevelsSelected && maxLvls > 1) {
+            const baseFpH = Math.min(1850, Math.max(580, 76 + runsN * 275));
+            const baseRowH = (baseFpH - 74) / runsN;
+            const baseInnerH = Math.max(60, baseRowH - 25);
+            const baseColW = (areaW - 4) / maxLvls;
+            const baseAw = Math.max(40, baseColW - 12);
+            const baseAh = Math.max(40, baseInnerH - 31);
+            for (const r of runsToPlot) {
+              for (const lvl of getSpatialLevels(r)) {
+                const { spanX, spanY } = getLevelSpanXY(lvl);
+                const sc = Math.min(baseAw / spanX, baseAh / spanY);
+                maxDrawW0 = Math.max(maxDrawW0, spanX * sc);
+                maxDrawH0 = Math.max(maxDrawH0, spanY * sc);
+              }
+            }
+          } else {
+            const cols0 = Math.min(runsN, runsN <= 2 ? runsN : 3);
+            const rowsN0 = Math.ceil(runsN / cols0);
+            const baseFpH = runsN > 3 ? 680 : 540;
+            const baseCw = areaW / cols0 - 6;
+            const baseCh = (baseFpH - 74) / rowsN0 - 6;
+            const baseAw = Math.max(40, baseCw - 16);
+            const baseAh = Math.max(40, baseCh - 56);
+            for (const r of runsToPlot) {
+              const rLvls = getSpatialLevels(r);
+              const lvl = selLevelIdx >= 0 && selLevelIdx < rLvls.length ? rLvls[selLevelIdx] : rLvls[0];
+              if (!lvl) continue;
+              const { spanX, spanY } = getLevelSpanXY(lvl);
+              const sc = Math.min(baseAw / spanX, baseAh / spanY);
+              maxDrawW0 = Math.max(maxDrawW0, spanX * sc);
+              maxDrawH0 = Math.max(maxDrawH0, spanY * sc);
+            }
+          }
+
+          if (!anyHasMats) {
+            const fallbackH = allLevelsSelected && maxLvls > 1
+              ? Math.min(1850, Math.max(580, 76 + runsN * 275))
+              : (runsN > 3 ? 680 : 540);
+            return {
+              spatialRuns,
+              primaryRun,
+              fpHeight: fallbackH,
+              variantSpec: { useRowCards: allLevelsSelected && maxLvls > 1, sideW: 0, planCols: maxLvls, planRows: 1, maxLvls, selLevelIdx, sideLayouts: new Map() },
+              topSpec: null
+            };
+          }
+
+          let planCols = 1;
+          let planRows = 1;
+          let sideW = 260;
+          if (maxLvls === 1) {
+            planCols = 1;
+            planRows = 1;
+            const freeW1 = Math.max(0, areaW - 14 - (maxDrawW0 + 16));
+            sideW = Math.min(340, Math.max(220, Math.floor(Math.min(freeW1, areaW * 0.31))));
+          } else {
+            const freeHorizW = areaW - 14 - maxLvls * (maxDrawW0 + 14);
+            if (freeHorizW >= 200) {
+              planCols = maxLvls;
+              planRows = 1;
+              sideW = Math.min(305, Math.floor(freeHorizW));
+            } else if (maxLvls >= 3) {
+              planCols = Math.max(1, Math.min(maxLvls - 1, Math.floor((areaW - 240) / Math.max(120, maxDrawW0 + 14)) || 1));
+              planRows = Math.ceil(maxLvls / planCols);
+              const freeWrap = Math.max(0, areaW - 14 - planCols * (maxDrawW0 + 14));
+              sideW = Math.min(305, Math.max(200, Math.floor(freeWrap)));
+            } else {
+              planCols = maxLvls;
+              planRows = 1;
+              sideW = Math.max(175, Math.min(235, Math.floor(areaW * 0.24)));
+            }
+          }
+
+          let maxSideH = 0;
+          const sideLayouts = new Map();
+          for (const r of runsToPlot) {
+            const mats = getRunMaterials(r);
+            const lay = mats.length ? layoutSideMaterials(mats, sideW - 16, measureCtx) : null;
+            if (lay) {
+              sideLayouts.set(r.id, lay);
+              if (lay.totalH > maxSideH) maxSideH = lay.totalH;
+            }
+          }
+
+          const topPad = maxLvls > 1 ? 18 : 14;
+          const minPlanBodyH = planRows * (Math.ceil(maxDrawH0) + topPad + 13);
+          const rowH = Math.max(maxLvls > 1 ? 275 : 262, 22 + 3 + minPlanBodyH, 22 + 10 + maxSideH);
+          const fpHeight = Math.max(maxLvls > 1 ? 580 : 540, 74 + runsN * rowH);
+          return {
+            spatialRuns,
+            primaryRun,
+            fpHeight,
+            variantSpec: { useRowCards: true, sideW, planCols, planRows, maxLvls, selLevelIdx, sideLayouts },
+            topSpec: null
+          };
+        }
+
+        // Single Run / Spatial Diff layout (Materials at top under "Level 1")
+        const levels = getSpatialLevels(primaryRun);
+        const activeLevels = selLevelIdx >= 0 && selLevelIdx < levels.length ? [levels[selLevelIdx]] : levels;
+        const cols = activeLevels.length > 1 ? 2 : 1;
+        const rowsN = Math.ceil(activeLevels.length / cols);
+        const maxLvls = activeLevels.length;
+        const baseFpH = maxLvls > 2 ? Math.min(1150, 100 + Math.ceil(maxLvls / 2) * 330) : 540;
+        const mats = getRunMaterials(primaryRun);
+        const isDiff = mode === "diff" && baseRun && baseRun.spatial && baseRun.id !== primaryRun.id;
+        const baseMats = isDiff ? getRunMaterials(baseRun) : null;
+        const topLayout = mats.length ? layoutTopMaterials(mats, baseMats, areaW - 20, measureCtx) : null;
+        const hasTopMats = Boolean(topLayout && topLayout.totalH > 0);
+        const lvlHdrH = hasTopMats ? 16 : 0;
+        const topMatH = hasTopMats ? topLayout.totalH + 6 : 0;
+        const oldInnerTopPad = activeLevels.length > 1 ? 18 : 14;
+        const extraH = hasTopMats ? Math.max(0, lvlHdrH + topMatH - (rowsN === 1 ? (oldInnerTopPad - 4) : 0)) : 0;
+
+        return {
+          spatialRuns,
+          primaryRun,
+          fpHeight: baseFpH + extraH,
+          variantSpec: null,
+          topSpec: { activeLevels, cols, rowsN, topLayout, hasTopMats, lvlHdrH, topMatH }
+        };
+      }
+
       function renderFloorplanGraphic({ ctx, w, h, runs, activeRun, baseRun, mode, levelKey, metric, paletteName, showWalls, showSensors, dayIdx, hourIdx }) {
         const T = getThemePalette();
         ctx.clearRect(0, 0, w, h);
         ctx.fillStyle = T.plotBg;
         ctx.fillRect(0, 0, w, h);
 
-        const spatialRuns = (runs || []).filter(r => r.spatial && r.spatial.areas && r.spatial.areas.length);
-        const primaryRun = (activeRun && activeRun.spatial) ? activeRun : spatialRuns[0];
+        const layoutSpec = computeFloorplanLayoutSpec({ runs, activeRun, baseRun, mode, levelKey, w, measureCtx: ctx });
+        const { spatialRuns, primaryRun, variantSpec, topSpec } = layoutSpec;
 
         if (!primaryRun) {
           ctx.fillStyle = T.textMuted;
@@ -7197,9 +7623,6 @@
 
         const isDiff = mode === "diff" && baseRun && baseRun.spatial && baseRun.id !== primaryRun.id;
         const spec = computeFloorplanMetricSpec(metric, dayIdx, hourIdx);
-        const levels = getSpatialLevels(primaryRun);
-        const selLevelIdx = levelKey === "all" ? -1 : parseInt(levelKey, 10);
-        const activeLevels = selLevelIdx >= 0 && selLevelIdx < levels.length ? [levels[selLevelIdx]] : levels;
 
         const pad = { top: 32, right: 8, bottom: 42, left: 8 };
         const areaW = Math.max(100, w - pad.left - pad.right);
@@ -7238,15 +7661,15 @@
 
         if (mode === "variants") {
           const runsToPlot = spatialRuns;
-          const allLevelsSelected = selLevelIdx < 0;
-          const maxLvls = allLevelsSelected ? Math.max(1, ...runsToPlot.map(r => getSpatialLevels(r).length)) : 1;
-          if (allLevelsSelected && maxLvls > 1) {
-            // One unified box per variant wrapping all its levels horizontally side-by-side
+          const { useRowCards, sideW, planCols, planRows, selLevelIdx, sideLayouts } = variantSpec;
+          if (useRowCards) {
+            // One unified card row per variant with optional left-side Materials panel + levels on right
             const rowsN = Math.max(1, runsToPlot.length);
             const rowH = areaH / rowsN;
             for (let ri = 0; ri < runsToPlot.length; ri++) {
               const r = runsToPlot[ri];
-              const rLvls = getSpatialLevels(r);
+              const allLvls = getSpatialLevels(r);
+              const rLvls = selLevelIdx < 0 ? allLvls : (selLevelIdx < allLvls.length ? [allLvls[selLevelIdx]] : [allLvls[0]].filter(Boolean));
               const gBox = {
                 x: pad.left,
                 y: pad.top + ri * rowH + (ri > 0 ? 4 : 0),
@@ -7255,23 +7678,38 @@
               };
               const innerY = gBox.y + groupHdrH;
               const innerH = Math.max(60, gBox.h - groupHdrH - 3);
-              const colW = (gBox.w - 4) / maxLvls;
+              const plansLeft = sideW > 0 ? (gBox.x + sideW + 8) : (gBox.x + 2);
+              const plansW = Math.max(80, gBox.x + gBox.w - 2 - plansLeft);
+              const colW = plansW / Math.max(1, planCols);
+              const subH = innerH / Math.max(1, planRows);
               const items = [];
               for (let li = 0; li < rLvls.length; li++) {
                 const lvl = rLvls[li];
                 const lData = collectLevelPointsAndBounds(r, lvl, null, "levels", metric, dayIdx, hourIdx);
+                const c = li % planCols;
+                const rowIdx = Math.floor(li / planCols);
                 const subBox = {
-                  x: gBox.x + 2 + li * colW,
-                  y: innerY,
+                  x: plansLeft + c * colW,
+                  y: innerY + rowIdx * subH,
                   w: colW,
-                  h: innerH,
-                  title: lvl.label
+                  h: subH,
+                  title: lvl.label,
+                  showTitle: true
                 };
-                const item = { run: r, level: lvl, lData, box: subBox, col: li, row: 0 };
+                const item = { run: r, level: lvl, lData, box: subBox, col: c, row: rowIdx };
                 items.push(item);
                 panels.push(item);
               }
-              groups.push({ run: r, headerTitle: r.displayName, gBox, cols: rLvls.length, rowsN: 1, items });
+              groups.push({
+                run: r,
+                headerTitle: r.displayName,
+                gBox,
+                cols: Math.min(planCols, Math.max(1, rLvls.length)),
+                rowsN: Math.max(1, Math.ceil(rLvls.length / Math.max(1, planCols))),
+                sideW,
+                sideLayout: sideLayouts.get(r.id) || null,
+                items
+              });
             }
           } else {
             const cols = Math.min(runsToPlot.length, Math.max(1, runsToPlot.length <= 2 ? runsToPlot.length : 3));
@@ -7296,22 +7734,23 @@
                 y: gBox.y + groupHdrH,
                 w: gBox.w - 4,
                 h: Math.max(60, gBox.h - groupHdrH - 3),
-                title: lvl.label
+                title: lvl.label,
+                showTitle: true
               };
               const item = { run: r, level: lvl, lData, box: subBox, col: 0, row: 0 };
               panels.push(item);
-              groups.push({ run: r, headerTitle: r.displayName, gBox, cols: 1, rowsN: 1, items: [item] });
+              groups.push({ run: r, headerTitle: r.displayName, gBox, cols: 1, rowsN: 1, sideW: 0, sideLayout: null, items: [item] });
             }
           }
         } else {
           // One unified box wrapping ALL levels of the same simulation (Selected Run / Spatial Diff)
+          const { activeLevels, cols, rowsN, topLayout, hasTopMats, lvlHdrH, topMatH } = topSpec;
           const gBox = { x: pad.left, y: pad.top, w: areaW, h: areaH };
-          const cols = activeLevels.length > 1 ? 2 : 1;
-          const rowsN = Math.ceil(activeLevels.length / cols);
           const innerX = gBox.x + 4;
-          const innerY = gBox.y + groupHdrH;
+          const headerBandH = groupHdrH + lvlHdrH + topMatH;
+          const innerY = gBox.y + headerBandH;
           const innerW = Math.max(80, gBox.w - 8);
-          const innerH = Math.max(80, gBox.h - groupHdrH - 4);
+          const innerH = Math.max(80, gBox.h - headerBandH - 4);
           const cw = innerW / cols;
           const ch = innerH / rowsN;
           const items = [];
@@ -7324,14 +7763,15 @@
               y: innerY + rowIdx * ch,
               w: cw,
               h: ch,
-              title: lvl.label
+              title: lvl.label,
+              showTitle: !hasTopMats || rowIdx > 0
             };
             const item = { run: primaryRun, level: lvl, lData, box: subBox, col: c, row: rowIdx };
             items.push(item);
             panels.push(item);
           }
           const gTitle = isDiff ? `${primaryRun.displayName} − ${baseRun.displayName}` : primaryRun.displayName;
-          groups.push({ run: primaryRun, headerTitle: gTitle, gBox, cols, rowsN, items });
+          groups.push({ run: primaryRun, headerTitle: gTitle, gBox, cols, rowsN, topLayout: hasTopMats ? topLayout : null, lvlHdrH, topMatH, items });
         }
 
         // Dynamic symmetric scale in diff mode
@@ -7391,20 +7831,61 @@
           }
           ctx.fillText(titleTxt, swX + 14, hdrCy);
 
+          // Single Run / Diff: Level row + Layers & Materials directly under "Level 1"
+          if (grp.topLayout) {
+            const lvlCy = gy + groupHdrH + 6;
+            const row0Cols = Math.min(grp.cols, grp.items.length);
+            for (let c = 0; c < row0Cols; c++) {
+              const it = grp.items[c];
+              const subBox = it.box;
+              const leftX = c === 0 ? gx + 10 : subBox.x + 6;
+              let statW = 0;
+              if (grp.items.length > 1) {
+                const subSum = computeSpatialMetricSummary(it.lData.pts, spec, isDiff);
+                statW = drawMetricText(ctx, subSum, subBox.x + subBox.w - 6, lvlCy, { fontSize: 12 });
+              }
+              ctx.textAlign = "left";
+              ctx.textBaseline = "middle";
+              ctx.fillStyle = T.textSecondary;
+              ctx.font = '600 11px "Segoe UI", sans-serif';
+              let sTitle = it.level.label;
+              const maxTW = Math.max(40, (subBox.x + subBox.w - 6) - leftX - (statW > 0 ? statW + 10 : 4));
+              if (ctx.measureText(sTitle).width > maxTW) {
+                while (sTitle.length > 4 && ctx.measureText(sTitle + "...").width > maxTW) sTitle = sTitle.slice(0, -1);
+                sTitle += "...";
+              }
+              ctx.fillText(sTitle, leftX, lvlCy);
+            }
+            drawTopMaterialsBlock(ctx, grp.topLayout, gx + 10, gy + groupHdrH + grp.lvlHdrH, T);
+          }
+
+          // All Variants: Left-side Materials column + clean vertical divider
+          if (grp.sideW > 0 && grp.sideLayout) {
+            drawSideMaterialsColumn(ctx, grp.sideLayout, gx + 10, gy + groupHdrH + 3, T);
+            const divX = Math.round(gx + grp.sideW + 4) + 0.5;
+            ctx.strokeStyle = T.plotGrid;
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            ctx.moveTo(divX, gy + groupHdrH + 4);
+            ctx.lineTo(divX, gy + gh - 6);
+            ctx.stroke();
+          }
+
           // Soft internal dividers between levels inside the same simulation container
           if (grp.cols > 1 || grp.rowsN > 1) {
-            const innerY0 = gy + groupHdrH + 4;
-            const innerY1 = gy + gh - 6;
             const firstBox = grp.items[0].box;
+            const innerY0 = firstBox.y + 4;
+            const innerY1 = gy + gh - 6;
             ctx.strokeStyle = T.plotGrid;
             ctx.lineWidth = 1;
             for (let c = 1; c < grp.cols; c++) {
               const lx = Math.round(firstBox.x + c * firstBox.w) + 0.5;
               ctx.beginPath(); ctx.moveTo(lx, innerY0); ctx.lineTo(lx, innerY1); ctx.stroke();
             }
+            const plansLeftX = grp.sideW > 0 ? gx + grp.sideW + 10 : gx + 10;
             for (let rIdx = 1; rIdx < grp.rowsN; rIdx++) {
               const ly = Math.round(firstBox.y + rIdx * firstBox.h) + 0.5;
-              ctx.beginPath(); ctx.moveTo(gx + 10, ly); ctx.lineTo(gx + gw - 10, ly); ctx.stroke();
+              ctx.beginPath(); ctx.moveTo(plansLeftX, ly); ctx.lineTo(gx + gw - 10, ly); ctx.stroke();
             }
           }
 
@@ -7422,6 +7903,7 @@
               showWalls,
               showSensors,
               showBadge: grp.items.length > 1,
+              showTitle: p.box.showTitle !== false,
               T
             });
             if (hit) panelsHit.push(hit);
@@ -7909,21 +8391,21 @@
           ? checked.filter(r => r.spatial && r.spatial.areas && r.spatial.areas.length)
           : runs;
         const plotRuns = plotRunsRaw.length ? plotRunsRaw : spatialRuns;
-        const maxLvls = state.fpLevel === "all" && plotRuns.length
-          ? Math.max(1, ...plotRuns.map(r => getSpatialLevels(r).length))
-          : 1;
-        let fpHeight = 540;
-        if (state.fpMode === "variants") {
-          if (state.fpLevel === "all" && maxLvls > 1) {
-            fpHeight = Math.min(1850, Math.max(580, 76 + plotRuns.length * 275));
-          } else if (plotRuns.length > 3) {
-            fpHeight = 680;
-          }
-        } else if (maxLvls > 2) {
-          fpHeight = Math.min(1150, 100 + Math.ceil(maxLvls / 2) * 330);
-        }
-        $("canvasFloorplan").style.cursor = state.fpMode === "levels" ? "pointer" : "default";
-        const cFp = setupCanvas($("canvasFloorplan"), fpHeight);
+        const fpCanvas = $("canvasFloorplan");
+        const fpParentW = fpCanvas.parentElement ? Math.floor(fpCanvas.parentElement.getBoundingClientRect().width) : 0;
+        const fpMeasureW = fpParentW >= 320 ? fpParentW : 960;
+        const fpMeasureCtx = fpCanvas.getContext ? fpCanvas.getContext("2d") : null;
+        const { fpHeight } = computeFloorplanLayoutSpec({
+          runs: plotRuns.length ? plotRuns : runs,
+          activeRun,
+          baseRun: fpRefRun,
+          mode: state.fpMode,
+          levelKey: state.fpLevel,
+          w: fpMeasureW,
+          measureCtx: fpMeasureCtx
+        });
+        fpCanvas.style.cursor = state.fpMode === "levels" ? "pointer" : "default";
+        const cFp = setupCanvas(fpCanvas, fpHeight);
         lastFloorplanGeom = renderFloorplanGraphic({
           ...cFp,
           runs: plotRuns.length ? plotRuns : runs,
@@ -8262,7 +8744,14 @@
         const srcEl = $(entry[0]);
         const rect = srcEl && srcEl.getBoundingClientRect ? srcEl.getBoundingClientRect() : { width: 960, height: 220 };
         const w = Math.max(600, Math.round(rect.width || entry[2] || 960));
-        const h = Math.max(140, Math.round(entry[3] || rect.height || 220));
+        let h = Math.max(140, Math.round(entry[3] || rect.height || 220));
+        if (chartKey === "floorplan") {
+          const fpRefRun = resolveRefRun(state.fpRefId, run?.id);
+          const spatialRuns = checked.filter(r => r.spatial && r.spatial.areas && r.spatial.areas.length);
+          const fpRuns = state.fpMode === "variants" && spatialRuns.length ? spatialRuns : state.runs;
+          const mCtx = fpCanvasEl?.getContext ? fpCanvasEl.getContext("2d") : null;
+          h = computeFloorplanLayoutSpec({ runs: fpRuns, activeRun: run, baseRun: fpRefRun, mode: state.fpMode, levelKey: state.fpLevel, w, measureCtx: mCtx }).fpHeight;
+        }
 
         const drawToCtx = (ctx) => {
           if (chartKey === "kpis") {
@@ -8949,6 +9438,7 @@
           existing.nAreas = parsed.nAreas;
           existing.areas = parsed.areas;
           existing.totalPts = parsed.totalPts;
+          if (parsed.materials?.length) existing.materials = parsed.materials;
           existing.projectSummary = parsed.projectSummary;
           existing.hasSummary = true;
           existing.cache.clear();
